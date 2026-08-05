@@ -1,40 +1,238 @@
-import json
-import sqlite3
-import random
-from telegram import (
-    Update,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
-    WebAppInfo,
-    MenuButtonWebApp,
-)
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters
-)
+import asyncio
+from aiogram import Bot, Dispatcher, types
+from aiogram.types import ContentType
+from aiogram.utils import executor
+from datetime import datetime
 
-# ----------------------------
-# CONFIG
-# ----------------------------
-import os
-TOKEN = os.environ["BOT_TOKEN"]        # <--- set as an environment variable, never hardcode this
-LEADER_IDS = [6555910081, 8399604250]  # <--- Telegram user_ids of pastors / elders / fellowship leaders
+API_TOKEN = "YOUR_BOT_TOKEN"
 
-# Your live Mini App (Cloudflare Pages)
-WEBAPP_URL = "https://church-app.yared6594.workers.dev"
+bot = Bot(token=API_TOKEN)
+dp = Dispatcher(bot)
 
-LEADER_LAST_TICKETS = {}
+# ================= DATA =================
+admins = [111111111, 222222222]  # your admin IDs
+admin_status = {admin: False for admin in admins}
+users = {}
+tickets = {}
+ticket_counter = 1
 
-# ----------------------------
-# DATABASE
-# ----------------------------
-def init_db():
-    with sqlite3.connect("bot_data.db") as conn:
-        c = conn.cursor()
-        c.execute("""
+notify_all_mode = set()
+notify_user_mode = {}
+schedule_mode = {}
+scheduled_notifications = []
+
+# ================= HELPERS =================
+def generate_ticket():
+    global ticket_counter
+    ticket_id = f"#{ticket_counter:03d}"
+    ticket_counter += 1
+    return ticket_id
+
+def get_least_busy_admin():
+    load = {admin: 0 for admin in admins}
+    for u in users.values():
+        load[u["admin"]] += 1
+
+    return min(load, key=load.get)
+
+# ================= START =================
+@dp.message_handler(commands=['start'])
+async def start(message: types.Message):
+    user_id = message.from_user.id
+
+    if user_id not in users:
+        admin = get_least_busy_admin()
+        ticket_id = generate_ticket()
+
+        users[user_id] = {"admin": admin, "ticket": ticket_id}
+        tickets[ticket_id] = user_id
+
+        await bot.send_message(admin, f"🆕 New Ticket {ticket_id}\nUser: {user_id}")
+
+    await message.reply("✅ You are connected to support")
+
+# ================= USER MESSAGE =================
+@dp.message_handler(lambda m: m.from_user.id not in admins, content_types=ContentType.ANY)
+async def user_message(message: types.Message):
+    user_id = message.from_user.id
+
+    if user_id not in users:
+        return
+
+    admin = users[user_id]["admin"]
+    ticket = users[user_id]["ticket"]
+
+    await bot.copy_message(admin, user_id, message.message_id)
+    await bot.send_message(admin, f"📩 Ticket {ticket}")
+
+# ================= ADMIN REPLY =================
+@dp.message_handler(lambda m: m.from_user.id in admins, content_types=ContentType.ANY)
+async def admin_reply(message: types.Message):
+    if not message.reply_to_message:
+        return
+
+    try:
+        user_id = message.reply_to_message.forward_from.id
+    except:
+        return
+
+    await bot.copy_message(user_id, message.chat.id, message.message_id)
+
+# ================= ADMIN ONLINE =================
+@dp.message_handler(commands=['online'])
+async def admin_online(message: types.Message):
+    if message.from_user.id in admins:
+        admin_status[message.from_user.id] = True
+        await message.reply("🟢 You are ONLINE")
+
+@dp.message_handler(commands=['offline'])
+async def admin_offline(message: types.Message):
+    if message.from_user.id in admins:
+        admin_status[message.from_user.id] = False
+        await message.reply("🔴 You are OFFLINE")
+
+# ================= DASHBOARD =================
+@dp.message_handler(commands=['dashboard'])
+async def dashboard(message: types.Message):
+    if message.from_user.id not in admins:
+        return
+
+    total_users = len(users)
+    total_tickets = len(tickets)
+
+    load = {admin: 0 for admin in admins}
+    for u in users.values():
+        load[u["admin"]] += 1
+
+    text = f"📊 DASHBOARD\n\nUsers: {total_users}\nTickets: {total_tickets}\n\n"
+
+    for admin in admins:
+        status = "🟢" if admin_status[admin] else "🔴"
+        text += f"{status} {admin} → {load[admin]} users\n"
+
+    await message.reply(text)
+
+# ================= TRANSFER =================
+@dp.message_handler(commands=['transfer'])
+async def transfer(message: types.Message):
+    if message.from_user.id not in admins:
+        return
+
+    try:
+        _, user_id, new_admin = message.text.split()
+        user_id = int(user_id)
+        new_admin = int(new_admin)
+
+        old_admin = users[user_id]["admin"]
+        users[user_id]["admin"] = new_admin
+
+        await bot.send_message(old_admin, f"🔄 User {user_id} transferred")
+        await bot.send_message(new_admin, f"📥 New user assigned: {user_id}")
+        await bot.send_message(user_id, "🔄 Your support admin changed")
+
+    except:
+        await message.reply("Usage: /transfer user_id new_admin_id")
+
+# ================= NOTIFY =================
+@dp.message_handler(commands=['notify'])
+async def notify_all(message: types.Message):
+    if message.from_user.id in admins:
+        notify_all_mode.add(message.from_user.id)
+        await message.reply("Send notification")
+
+@dp.message_handler(commands=['notify_user'])
+async def notify_user(message: types.Message):
+    if message.from_user.id in admins:
+        try:
+            _, uid = message.text.split()
+            notify_user_mode[message.from_user.id] = int(uid)
+            await message.reply("Send message")
+        except:
+            await message.reply("Usage: /notify_user user_id")
+
+@dp.message_handler(commands=['schedule'])
+async def schedule(message: types.Message):
+    if message.from_user.id in admins:
+        schedule_mode[message.from_user.id] = {"step": "time"}
+        await message.reply("Send time HH:MM")
+
+# ================= MAIN HANDLER =================
+@dp.message_handler(content_types=ContentType.ANY)
+async def main_handler(message: types.Message):
+    uid = message.from_user.id
+
+    # notify all
+    if uid in notify_all_mode:
+        for u in users:
+            try:
+                await bot.copy_message(u, message.chat.id, message.message_id)
+            except:
+                pass
+
+        notify_all_mode.remove(uid)
+        await message.reply("✅ Sent to all")
+        return
+
+    # notify user
+    if uid in notify_user_mode:
+        target = notify_user_mode[uid]
+
+        try:
+            await bot.copy_message(target, message.chat.id, message.message_id)
+            await message.reply("✅ Sent")
+        except:
+            await message.reply("❌ Failed")
+
+        del notify_user_mode[uid]
+        return
+
+    # schedule
+    if uid in schedule_mode:
+        step = schedule_mode[uid]["step"]
+
+        if step == "time":
+            schedule_mode[uid]["time"] = message.text
+            schedule_mode[uid]["step"] = "content"
+            await message.reply("Send content")
+            return
+
+        elif step == "content":
+            scheduled_notifications.append({
+                "time": schedule_mode[uid]["time"],
+                "chat_id": message.chat.id,
+                "message_id": message.message_id
+            })
+
+            del schedule_mode[uid]
+            await message.reply("✅ Scheduled")
+            return
+
+# ================= SCHEDULER =================
+async def scheduler():
+    while True:
+        now = datetime.now().strftime("%H:%M")
+
+        for note in scheduled_notifications[:]:
+            if note["time"] == now:
+                for u in users:
+                    try:
+                        await bot.copy_message(
+                            u,
+                            note["chat_id"],
+                            note["message_id"]
+                        )
+                    except:
+                        pass
+
+                scheduled_notifications.remove(note)
+
+        await asyncio.sleep(30)
+
+# ================= RUN =================
+if __name__ == "__main__":
+    loop = asyncio.get_event_loop()
+    loop.create_task(scheduler())
+    executor.start_polling(dp, skip_updates=True)is         c.execute("""
         CREATE TABLE IF NOT EXISTS members (
             user_id INTEGER PRIMARY KEY,
             assigned_leader INTEGER,
