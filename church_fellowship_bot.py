@@ -21,7 +21,7 @@ from telegram.ext import (
 # CONFIG
 # ----------------------------
 TOKEN = os.environ["BOT_TOKEN"]        # <--- set as an environment variable, never hardcode this
-LEADER_IDS = [6555910081, 8399604250,5201555268]  # <--- Telegram user_ids of pastors / elders / fellowship leaders
+LEADER_IDS = [6555910081, 8399604250]  # <--- Telegram user_ids of pastors / elders / fellowship leaders
 
 # Your live Mini App (Cloudflare Pages)
 WEBAPP_URL = "https://church-app.yared6594.workers.dev"
