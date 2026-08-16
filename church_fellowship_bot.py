@@ -553,4 +553,82 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     member_ids = get_all_member_ids()
     sent, failed = 0, 0
-    for mid in 
+    for mid in member_ids:
+        try:
+            await context.bot.send_message(mid, f"📢 Church Announcement:\n{text}")
+            sent += 1
+        except Exception:
+            failed += 1
+
+    await update.message.reply_text(f"Broadcast complete. Delivered: {sent}, Failed: {failed}.")
+
+async def track_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    leader_id = update.effective_user.id
+    if leader_id not in LEADER_IDS:
+        return
+
+    try:
+        uid = int(context.args[0])
+    except (IndexError, ValueError):
+        await update.message.reply_text("Usage: /track <user_id>")
+        return
+
+    if get_assigned_leader(uid) != leader_id:
+        await update.message.reply_text("Access Denied: You can only view history for members currently assigned to you.")
+        return
+
+    with sqlite3.connect("bot_data.db") as conn:
+        rows = conn.execute(
+            "SELECT id, kind, msg, status FROM tickets WHERE uid=? ORDER BY id", (uid,)
+        ).fetchall()
+
+    txt = "\n".join(f"#{i} [{s.upper()}] [{k}] {m}" for i, k, m, s in rows)
+    await update.message.reply_text(f"📜 Interaction History for Member {uid}:\n{txt}" if txt else "No records found.")
+
+async def addsermon(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in LEADER_IDS:
+        return
+    context.user_data["awaiting_resource_cat"] = "sermons"
+    await update.message.reply_text("Upload media for Sermons category (Photo, Voice, or File).")
+
+async def adddevotional(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in LEADER_IDS:
+        return
+    context.user_data["awaiting_resource_cat"] = "devotionals"
+    await update.message.reply_text("Upload media for Devotionals category (Photo, Voice, or File).")
+
+async def addhymn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in LEADER_IDS:
+        return
+    context.user_data["awaiting_resource_cat"] = "hymns"
+    await update.message.reply_text("Upload media for Hymns category (Photo, Voice, or File).")
+
+# ----------------------------
+# INITIALIZATION & EXECUTION
+# ----------------------------
+async def post_init(application):
+    await application.bot.set_chat_menu_button(
+        menu_button=MenuButtonWebApp(text="Church App", web_app=WebAppInfo(url=WEBAPP_URL))
+    )
+
+init_db()
+
+app = ApplicationBuilder().token(TOKEN).post_init(post_init).build()
+
+app.add_handler(CommandHandler("start", start))
+app.add_handler(CommandHandler("ticket", reply_ticket))
+app.add_handler(CommandHandler("close", close_ticket))
+app.add_handler(CommandHandler("msg", msg_member))
+app.add_handler(CommandHandler("track", track_member))
+app.add_handler(CommandHandler("transfer", transfer_member))
+app.add_handler(CommandHandler("broadcast", broadcast))
+app.add_handler(CommandHandler("addsermon", addsermon))
+app.add_handler(CommandHandler("adddevotional", adddevotional))
+app.add_handler(CommandHandler("addhymn", addhymn))
+
+app.add_handler(MessageHandler(filters.StatusUpdate.WEB_APP_DATA, handle_webapp_data))
+app.add_handler(MessageHandler(filters.PHOTO | filters.VOICE | filters.Document.ALL, media_router))
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, central_message_handler))
+
+print("Church Fellowship Portal operating normally...")
+app.run_polling()
