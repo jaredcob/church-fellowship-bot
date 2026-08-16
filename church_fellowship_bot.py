@@ -234,6 +234,7 @@ async def member_logic(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     text = update.message.text
 
+    # 1. Menu buttons are handled locally by the bot (not sent to leader)
     if text == "📖 Resources":
         await update.message.reply_text("Select a resource category:", reply_markup=RESOURCE_MENU)
         return
@@ -295,19 +296,11 @@ async def member_logic(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Go ahead, type your message and I'll pass it along.")
         return
 
+    # 2. Regular user chat messages are forwarded to the leader
     await route_to_leader(update, context, text, kind="message")
 
 async def route_to_leader(update, context, text, kind, file_id=None, file_type=None):
     uid = update.effective_user.id
-
-    # Enforce Single Open Ticket Rule
-    active_ticket = get_active_ticket(uid)
-    if active_ticket:
-        await update.message.reply_text(
-            f"Notice: You currently have an active support ticket (#{active_ticket[0]}).\n"
-            "Please wait for your fellowship leader to respond and close your current request before submitting a new one."
-        )
-        return
 
     leader_id = get_assigned_leader(uid)
     if not leader_id:
@@ -315,6 +308,23 @@ async def route_to_leader(update, context, text, kind, file_id=None, file_type=N
         with sqlite3.connect("bot_data.db") as conn:
             conn.execute("UPDATE members SET assigned_leader=? WHERE user_id=?", (leader_id, uid))
 
+    active_ticket = get_active_ticket(uid)
+
+    # Forward message as follow-up if conversation is open
+    if active_ticket:
+        ticket_id = active_ticket[0]
+        try:
+            msg_body = f"💬 Follow-up on Ticket #{ticket_id}\nMember ID: {uid}\nContent: {text}\n\nReply via: /ticket {ticket_id}"
+            if file_id:
+                await send_media(context, leader_id, file_type, file_id, caption=msg_body)
+            else:
+                await context.bot.send_message(leader_id, msg_body)
+            await update.message.reply_text("✅ Message sent to your leader.")
+        except Exception:
+            await update.message.reply_text("Delivery failed. Please try again.")
+        return
+
+    # Create new ticket if no active session exists
     with sqlite3.connect("bot_data.db") as conn:
         cur = conn.execute(
             "INSERT INTO tickets (uid, leader_id, kind, msg, status) VALUES (?,?,?,?,'open')",
@@ -336,7 +346,7 @@ async def route_to_leader(update, context, text, kind, file_id=None, file_type=N
             await send_media(context, leader_id, file_type, file_id, caption=msg_body)
         else:
             await context.bot.send_message(leader_id, msg_body)
-        await update.message.reply_text(f"✅ Submission received (Ticket #{ticket_id}). A leader will review it shortly.")
+        await update.message.reply_text(f"✅ Message delivered (Ticket #{ticket_id}).")
     except Exception:
         await update.message.reply_text(f"Ticket #{ticket_id} logged. Leader notification pending.")
 
