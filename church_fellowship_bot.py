@@ -1,6 +1,5 @@
 import json
 import sqlite3
-import random
 import os
 from datetime import datetime
 from telegram import (
@@ -59,13 +58,11 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )""")
         
-        # Upgrade existing tickets table if created_at column is missing
         try:
             c.execute("ALTER TABLE tickets ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
         except sqlite3.OperationalError:
             pass
 
-        # Chat logs table to track interaction history with dates & leader IDs
         c.execute("""
         CREATE TABLE IF NOT EXISTS chat_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -107,6 +104,25 @@ def log_chat_interaction(display_id, uid, sender_id, sender_role, msg_text):
             (display_id, uid, sender_id, sender_role, msg_text, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
         )
 
+def get_next_available_leader():
+    """
+    EQUAL WORKLOAD BALANCER:
+    Finds the leader with the fewest open tickets.
+    If leaders have equal workloads, assigns sequentially.
+    """
+    with sqlite3.connect("bot_data.db") as conn:
+        workload = {lid: 0 for lid in LEADER_IDS}
+        rows = conn.execute(
+            "SELECT leader_id, COUNT(*) FROM tickets WHERE status='open' GROUP BY leader_id"
+        ).fetchall()
+        
+        for lid, count in rows:
+            if lid in workload:
+                workload[lid] = count
+                
+        # Return leader with minimum active open tickets
+        return min(workload, key=workload.get)
+
 def get_assigned_leader(uid):
     with sqlite3.connect("bot_data.db") as conn:
         r = conn.execute(
@@ -121,17 +137,13 @@ def get_all_member_ids():
     return [r[0] for r in rows]
 
 def next_ticket_display(origin):
-    """
-    Two independent counters: 'bot' -> plain numbers (1, 2, 3...),
-    'web' (Mini App) -> A-prefixed numbers (A1, A2, A3...).
-    """
     with sqlite3.connect("bot_data.db") as conn:
         conn.execute("UPDATE counters SET value = value + 1 WHERE name=?", (origin,))
         val = conn.execute("SELECT value FROM counters WHERE name=?", (origin,)).fetchone()[0]
     return f"A{val}" if origin == "web" else str(val)
 
 def get_ticket(display_id):
-    """Look up a ticket by its human-facing number, e.g. '7' or 'A3'."""
+    """Look up a ticket by its human-facing number, e.g. '1', '7', or 'A3'."""
     with sqlite3.connect("bot_data.db") as conn:
         r = conn.execute(
             "SELECT id, uid, leader_id, status FROM tickets WHERE display_id=? COLLATE NOCASE",
@@ -145,7 +157,7 @@ def get_active_ticket(uid):
             "SELECT id, display_id, kind, msg FROM tickets WHERE uid=? AND status='open' ORDER BY id DESC LIMIT 1",
             (uid,)
         ).fetchone()
-    return r  # (internal_id, display_id, kind, msg) or None
+    return r
 
 # ----------------------------
 # MENUS
@@ -176,14 +188,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "──────────────────────────────\n\n"
             "📋 **Operations & Management Commands:**\n"
             "• `/status` — View real-time leader workloads & active ticket routing\n"
-            "• `/track <user_id>` or `/history <user_id>` — View member ticket & chat history\n"
-            "• `/transfer_ticket <ticket_id> <leader_id>` — Transfer an open ticket to another leader\n"
-            "• `/admintransfer <user_id> <leader_id>` — Reassign a member to a new leader\n"
+            "• `/track <ticket_id or user_id>` or `/history <id>` — View member history\n"
+            "• `/transfer_ticket <ticket_id> <leader_id>` — Transfer an open ticket\n"
+            "• `/admintransfer <user_id> <leader_id>` — Reassign member to new leader\n"
             "• `/adminbroadcast <message>` — Send an announcement to all members\n\n"
             "📚 **Resource Management Commands:**\n"
-            "• `/adminaddpdf` | `/adminaddsermon` | `/adminadddevotional` | `/adminaddhymn` — Upload church resources\n\n"
-            "───────────── Notice ─────────────\n"
-            "⚠️ Support Leaders can view operation metrics and interaction history, but cannot send direct chat messages to members.",
+            "• `/adminaddpdf` | `/adminaddsermon` | `/adminadddevotional` | `/adminaddhymn` — Upload church resources\n",
             parse_mode="Markdown"
         )
         return
@@ -198,7 +208,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• /close <id> - Resolve and close an active ticket\n"
             "• /msg <user_id> <message> - Send direct message to assigned member\n"
             "• /transfer <user_id> <new_leader_id> - Transfer member to another leader\n"
-            "• /track <user_id> - View interaction history for assigned member\n"
+            "• /track <ticket_id or user_id> - View interaction history\n"
             "• /broadcast <message> - Send announcement to all members\n"
             "• /addsermon | /adddevotional | /addhymn - Add resource media"
         )
@@ -335,15 +345,14 @@ async def member_logic(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if text == "🔄 Request Reassignment":
+        new_leader = get_next_available_leader()
         old_leader = get_assigned_leader(uid)
-        available = [l for l in LEADER_IDS if l != old_leader]
-        new_leader = random.choice(available) if available else random.choice(LEADER_IDS)
 
         with sqlite3.connect("bot_data.db") as conn:
             conn.execute("UPDATE members SET assigned_leader=? WHERE user_id=?", (new_leader, uid))
             conn.execute("UPDATE tickets SET leader_id=? WHERE uid=? AND status='open'", (new_leader, uid))
 
-        if old_leader:
+        if old_leader and old_leader != new_leader:
             try:
                 await context.bot.send_message(
                     old_leader,
@@ -384,7 +393,8 @@ async def route_to_leader(update, context, text, kind, file_id=None, file_type=N
 
     leader_id = get_assigned_leader(uid)
     if not leader_id:
-        leader_id = random.choice(LEADER_IDS)
+        # EQUAL DISTRIBUTION: Pick the leader with the least open workload
+        leader_id = get_next_available_leader()
         with sqlite3.connect("bot_data.db") as conn:
             conn.execute("UPDATE members SET assigned_leader=? WHERE user_id=?", (leader_id, uid))
 
@@ -677,14 +687,12 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Broadcast complete. Delivered: {sent}, Failed: {failed}.")
 
 # ----------------------------
-# ENHANCED AUDIT & HISTORY TRACKING (/track & /history)
+# DUAL-LOOKUP AUDIT & HISTORY TRACKING (/track & /history)
 # ----------------------------
 async def track_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Commands: /track <user_id> or /history <user_id>
-    Accessible to:
-    - Support Leaders (SUPPORT_ADMIN_IDS): View any member's history.
-    - Full Leaders (LEADER_IDS): View history ONLY if currently assigned to that member.
+    Commands: /track <ticket_id or user_id> or /history <ticket_id or user_id>
+    Supports inputting either a Ticket ID (e.g., 1, A3) OR a Telegram User ID (e.g., 6555910081).
     """
     caller_id = update.effective_user.id
 
@@ -692,14 +700,27 @@ async def track_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        uid = int(context.args[0])
-    except (IndexError, ValueError):
-        await update.message.reply_text("Usage: `/track <user_id>` or `/history <user_id>`", parse_mode="Markdown")
+        target_input = context.args[0].strip()
+    except IndexError:
+        await update.message.reply_text("Usage: `/track <ticket_id or user_id>` or `/history <ticket_id or user_id>`", parse_mode="Markdown")
         return
+
+    uid = None
+    # Check if input matches a Ticket Display ID first (e.g., '1', 'A3')
+    ticket = get_ticket(target_input)
+    if ticket:
+        uid = ticket[1]
+    else:
+        # Otherwise, check if input is a Telegram User ID
+        try:
+            uid = int(target_input)
+        except ValueError:
+            await update.message.reply_text("❌ Error: Invalid Ticket ID or User ID format.", parse_mode="Markdown")
+            return
 
     assigned_leader = get_assigned_leader(uid)
     if not assigned_leader:
-        await update.message.reply_text(f"❌ Error: Member `{uid}` is not registered in the system.", parse_mode="Markdown")
+        await update.message.reply_text(f"❌ Error: Member/User ID `{uid}` is not registered in the system.", parse_mode="Markdown")
         return
 
     # Permissions check: Full Leaders can only track their assigned members
@@ -709,13 +730,11 @@ async def track_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     with sqlite3.connect("bot_data.db") as conn:
-        # Fetch all tickets (OPEN and CLOSED)
         tickets = conn.execute(
             "SELECT display_id, kind, msg, status, leader_id, created_at FROM tickets WHERE uid=? ORDER BY id DESC",
             (uid,)
         ).fetchall()
 
-        # Fetch chat log history
         logs = conn.execute(
             "SELECT display_id, sender_id, sender_role, msg, created_at FROM chat_logs WHERE uid=? ORDER BY id ASC",
             (uid,)
@@ -751,7 +770,6 @@ async def track_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         out += "• No communication logs found.\n"
 
-    # Split message if it exceeds Telegram's 4096 character limit
     if len(out) > 4000:
         for chunk in [out[i:i + 4000] for i in range(0, len(out), 4000)]:
             await update.message.reply_text(chunk, parse_mode="Markdown")
@@ -780,7 +798,6 @@ async def addhymn(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # SUPPORT LEADER ADDITIONS
 # ----------------------------
 async def status_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Support Leader command: /status — view leader workloads and active tickets."""
     uid = update.effective_user.id
     if uid not in SUPPORT_ADMIN_IDS:
         return
@@ -819,7 +836,6 @@ async def status_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(status_text, parse_mode="Markdown")
 
 async def transfer_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Support Leader command: /transfer_ticket <ticket_id> <new_leader_id>"""
     uid = update.effective_user.id
     if uid not in SUPPORT_ADMIN_IDS:
         return
@@ -851,7 +867,6 @@ async def transfer_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     log_chat_interaction(ref, member_uid, uid, "SUPPORT_ADMIN", f"[TICKET TRANSFERRED TO LEADER {new_leader}]")
 
-    # Notify New Leader
     try:
         await context.bot.send_message(
             new_leader,
@@ -860,7 +875,6 @@ async def transfer_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
-    # Notify Target Member
     try:
         await context.bot.send_message(
             member_uid,
@@ -872,7 +886,6 @@ async def transfer_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Ticket #{ref} successfully reassigned to Leader {new_leader}.")
 
 async def admin_transfer_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Support Leader command: /admintransfer <user_id> <new_leader_id>"""
     uid = update.effective_user.id
     if uid not in SUPPORT_ADMIN_IDS:
         return
@@ -901,7 +914,6 @@ async def admin_transfer_member(update: Update, context: ContextTypes.DEFAULT_TY
 
     log_chat_interaction("SYSTEM", target_uid, uid, "SUPPORT_ADMIN", f"[MEMBER REASSIGNED TO LEADER {new_leader}]")
 
-    # Notify Target Member
     try:
         await context.bot.send_message(
             target_uid,
@@ -910,7 +922,6 @@ async def admin_transfer_member(update: Update, context: ContextTypes.DEFAULT_TY
     except Exception:
         pass
 
-    # Notify New Leader
     active_t = get_active_ticket(target_uid)
     try:
         if active_t:
@@ -932,7 +943,6 @@ async def admin_transfer_member(update: Update, context: ContextTypes.DEFAULT_TY
     await update.message.reply_text(f"✅ Member {target_uid} successfully transferred to Leader {new_leader}.")
 
 async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Support Leader command: /adminbroadcast <message>"""
     uid = update.effective_user.id
     if uid not in SUPPORT_ADMIN_IDS:
         return
@@ -956,7 +966,6 @@ async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Broadcast completed. Success: {sent}, Failed: {failed}.")
 
 async def admin_add_resource(update: Update, context: ContextTypes.DEFAULT_TYPE, category: str):
-    """Support Leader upload trigger for media resources & PDFs"""
     uid = update.effective_user.id
     if uid not in SUPPORT_ADMIN_IDS:
         return
