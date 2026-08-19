@@ -577,6 +577,21 @@ async def leader_text_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Delivery Failed: {e}")
 
 # ----------------------------
+# CHAT RESTRICTION ENFORCERS
+# ----------------------------
+def is_support_leader_blocked(uid: int) -> bool:
+    """Returns True if user is a Support Leader trying to perform chat/history actions."""
+    return uid in SUPPORT_ADMIN_IDS
+
+# Attach these guards to your chat/history command handlers:
+async def block_support_chat_attempts(update: Update):
+    """Call inside /ticket, /msg, /track, /close or text message routers."""
+    if is_support_leader_blocked(update.effective_user.id):
+        await update.message.reply_text("❌ Access Denied: Support Leaders cannot view history or chat directly with members.")
+        return True
+    return False
+
+# ----------------------------
 # INIT & STARTUP
 # ----------------------------
 async def post_init(application):
