@@ -25,7 +25,7 @@ LEADER_IDS = [6555910081, 8399604250]  # Pastor/Elder Telegram User IDs
 
 WEBAPP_URL = "https://church-app.yared6594.workers.dev"
 
-# ----------------------------AC
+# ----------------------------
 # DATABASE MANAGEMENT
 # ----------------------------
 def init_db():
@@ -634,6 +634,157 @@ async def addhymn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Upload media for Hymns category (Photo, Voice, or File).")
 
 # ----------------------------
+# SUPPORT ADMIN ADDITIONS
+# ----------------------------
+raw_support_admins = os.environ.get("SUPPORT_ADMIN_IDS", "999888777")
+SUPPORT_ADMIN_IDS = [int(x.strip()) for x in raw_support_admins.split(",") if x.strip().isdigit()]
+
+async def status_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Support Admin command: /status — view leader workloads and active tickets."""
+    uid = update.effective_user.id
+    if uid not in SUPPORT_ADMIN_IDS:
+        return
+
+    with sqlite3.connect("bot_data.db") as conn:
+        workload = conn.execute(
+            "SELECT leader_id, COUNT(*) FROM tickets WHERE status='open' GROUP BY leader_id"
+        ).fetchall()
+        active_chats = conn.execute(
+            "SELECT display_id, uid, leader_id FROM tickets WHERE status='open'"
+        ).fetchall()
+        total_members = conn.execute("SELECT COUNT(*) FROM members").fetchone()[0]
+
+    workload_map = {lid: 0 for lid in LEADER_IDS}
+    for lid, count in workload:
+        if lid in workload_map:
+            workload_map[lid] = count
+
+    status_text = "📊 **SYSTEM WORKLOAD & LEADER STATUS**\n\n"
+    status_text += f"👥 **Total Registered Members:** {total_members}\n"
+    status_text += f"💬 **Users Currently Talking:** {len(active_chats)}\n\n"
+
+    status_text += "⚖️ **Leader Ticket Load:**\n"
+    for lid, count in workload_map.items():
+        status_text += f"• Leader `{lid}`: **{count} active ticket(s)**\n"
+
+    status_text += "\n📌 **Active Ticket Routing:**\n"
+    if active_chats:
+        for display_id, m_id, l_id in active_chats:
+            status_text += f"• Ticket #{display_id} | Member `{m_id}` ➡️ Leader `{l_id}`\n"
+    else:
+        status_text += "• No open tickets at this time.\n"
+
+    await update.message.reply_text(status_text)
+
+async def transfer_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Support Admin command: /transfer_ticket <ticket_id> <new_leader_id>"""
+    uid = update.effective_user.id
+    if uid not in SUPPORT_ADMIN_IDS:
+        return
+
+    try:
+        ref = context.args[0].strip()
+        new_leader = int(context.args[1])
+    except (IndexError, ValueError):
+        await update.message.reply_text("Usage: /transfer_ticket <ticket_id> <new_leader_id>")
+        return
+
+    if new_leader not in LEADER_IDS:
+        await update.message.reply_text("Error: Target leader ID must belong to an active Full Leader.")
+        return
+
+    ticket = get_ticket(ref)
+    if not ticket:
+        await update.message.reply_text("Error: Ticket ID not found.")
+        return
+
+    internal_id, member_uid, _, status = ticket
+    if status != 'open':
+        await update.message.reply_text("Notice: Ticket is closed and cannot be transferred.")
+        return
+
+    with sqlite3.connect("bot_data.db") as conn:
+        conn.execute("UPDATE tickets SET leader_id=? WHERE id=?", (new_leader, internal_id))
+        conn.execute("UPDATE members SET assigned_leader=? WHERE user_id=?", (new_leader, member_uid))
+
+    try:
+        await context.bot.send_message(
+            new_leader,
+            f"📌 Transferred Ticket #{ref}: Member `{member_uid}` assigned to you.\nReply via: /ticket {ref}"
+        )
+    except Exception:
+        pass
+
+    await update.message.reply_text(f"✅ Ticket #{ref} successfully reassigned to Leader {new_leader}.")
+
+async def admin_transfer_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Support Admin command: /admintransfer <user_id> <new_leader_id> (separate from the Leader's own /transfer)"""
+    uid = update.effective_user.id
+    if uid not in SUPPORT_ADMIN_IDS:
+        return
+
+    try:
+        target_uid = int(context.args[0])
+        new_leader = int(context.args[1])
+    except (IndexError, ValueError):
+        await update.message.reply_text("Usage: /admintransfer <user_id> <new_leader_id>")
+        return
+
+    if new_leader not in LEADER_IDS:
+        await update.message.reply_text("Error: Target leader ID must belong to an active Full Leader.")
+        return
+
+    with sqlite3.connect("bot_data.db") as conn:
+        conn.execute("UPDATE members SET assigned_leader=? WHERE user_id=?", (new_leader, target_uid))
+        conn.execute("UPDATE tickets SET leader_id=? WHERE uid=? AND status='open'", (new_leader, target_uid))
+
+    await update.message.reply_text(f"✅ Member {target_uid} successfully transferred to Leader {new_leader}.")
+
+async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Support Admin command: /adminbroadcast <message> (separate from the Leader's own /broadcast)"""
+    uid = update.effective_user.id
+    if uid not in SUPPORT_ADMIN_IDS:
+        return
+
+    text = " ".join(context.args)
+    if not text:
+        await update.message.reply_text("Usage: /adminbroadcast <message>")
+        return
+
+    with sqlite3.connect("bot_data.db") as conn:
+        member_ids = [r[0] for r in conn.execute("SELECT user_id FROM members").fetchall()]
+
+    sent, failed = 0, 0
+    for mid in member_ids:
+        try:
+            await context.bot.send_message(mid, f"📢 Church Announcement:\n{text}")
+            sent += 1
+        except Exception:
+            failed += 1
+
+    await update.message.reply_text(f"Broadcast completed. Success: {sent}, Failed: {failed}.")
+
+async def admin_add_resource(update: Update, context: ContextTypes.DEFAULT_TYPE, category: str):
+    """Support Admin upload trigger for PDFs/Sermons/Devotionals/Hymns (separate from the Leader's addsermon/adddevotional/addhymn)"""
+    uid = update.effective_user.id
+    if uid not in SUPPORT_ADMIN_IDS:
+        return
+
+    context.user_data["awaiting_resource_cat"] = category
+    await update.message.reply_text(f"Upload media or PDF for the {category.capitalize()} category now.")
+
+def is_support_leader_blocked(uid: int) -> bool:
+    """Returns True if user is a Support Leader trying to perform chat/history actions."""
+    return uid in SUPPORT_ADMIN_IDS
+
+async def block_support_chat_attempts(update: Update):
+    """Call inside /ticket, /msg, /track, /close or text message routers."""
+    if is_support_leader_blocked(update.effective_user.id):
+        await update.message.reply_text("❌ Access Denied: Support Leaders cannot view history or chat directly with members.")
+        return True
+    return False
+
+# ----------------------------
 # INITIALIZATION & EXECUTION
 # ----------------------------
 async def post_init(application):
@@ -655,6 +806,14 @@ app.add_handler(CommandHandler("broadcast", broadcast))
 app.add_handler(CommandHandler("addsermon", addsermon))
 app.add_handler(CommandHandler("adddevotional", adddevotional))
 app.add_handler(CommandHandler("addhymn", addhymn))
+app.add_handler(CommandHandler("status", status_dashboard))
+app.add_handler(CommandHandler("transfer_ticket", transfer_ticket))
+app.add_handler(CommandHandler("admintransfer", admin_transfer_member))
+app.add_handler(CommandHandler("adminbroadcast", admin_broadcast))
+app.add_handler(CommandHandler("adminaddpdf", lambda u, c: admin_add_resource(u, c, "devotionals")))
+app.add_handler(CommandHandler("adminaddsermon", lambda u, c: admin_add_resource(u, c, "sermons")))
+app.add_handler(CommandHandler("adminadddevotional", lambda u, c: admin_add_resource(u, c, "devotionals")))
+app.add_handler(CommandHandler("adminaddhymn", lambda u, c: admin_add_resource(u, c, "hymns")))
 
 app.add_handler(MessageHandler(filters.StatusUpdate.WEB_APP_DATA, handle_webapp_data))
 app.add_handler(MessageHandler(filters.PHOTO | filters.VOICE | filters.Document.ALL, media_router))
