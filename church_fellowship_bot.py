@@ -18,10 +18,14 @@ from telegram.ext import (
 )
 
 # ----------------------------
-# CONFIGURATION
+# CONFIGURATION & ROLES
 # ----------------------------
 TOKEN = os.environ["BOT_TOKEN"]
 LEADER_IDS = [6555910081, 8399604250]  # Pastor/Elder Telegram User IDs
+
+# Support Leaders (Admins who manage workloads, transfer tickets, broadcast, and upload resources, but cannot chat or view history)
+raw_support_admins = os.environ.get("SUPPORT_ADMIN_IDS", "999888777")
+SUPPORT_ADMIN_IDS = [int(x.strip()) for x in raw_support_admins.split(",") if x.strip().isdigit()]
 
 WEBAPP_URL = "https://church-app.yared6594.workers.dev"
 
@@ -137,6 +141,21 @@ RESOURCE_MENU = ReplyKeyboardMarkup(
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
 
+    if uid in SUPPORT_ADMIN_IDS:
+        await update.message.reply_text(
+            "====================================\n"
+            "    SUPPORT LEADER CONTROL PORTAL   \n"
+            "====================================\n\n"
+            "Available Operations Commands:\n"
+            "• /status - View leader workloads & active ticket routing\n"
+            "• /transfer_ticket <ticket_id> <leader_id> - Transfer ticket to leader\n"
+            "• /admintransfer <user_id> <leader_id> - Reassign member to leader\n"
+            "• /adminbroadcast <message> - Send announcement to all members\n"
+            "• /adminaddpdf | /adminaddsermon | /adminadddevotional | /adminaddhymn - Upload resources\n\n"
+            "⚠️ Notice: Support Leaders cannot view history or chat directly with members."
+        )
+        return
+
     if uid in LEADER_IDS:
         await update.message.reply_text(
             "====================================\n"
@@ -171,6 +190,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def central_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
 
+    if uid in SUPPORT_ADMIN_IDS:
+        await update.message.reply_text("❌ Access Denied: Support Leaders are not permitted to chat directly with members.")
+        return
+
     if uid in LEADER_IDS:
         if "reply_uid" in context.user_data:
             await leader_text_reply(update, context)
@@ -195,7 +218,7 @@ async def media_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     caption = msg.caption or ""
 
-    if uid in LEADER_IDS:
+    if uid in SUPPORT_ADMIN_IDS or uid in LEADER_IDS:
         cat = context.user_data.pop("awaiting_resource_cat", None)
         if cat:
             with sqlite3.connect("bot_data.db") as conn:
@@ -206,6 +229,11 @@ async def media_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.reply_text(f"Resource successfully added to {cat.capitalize()}.")
             return
 
+    if uid in SUPPORT_ADMIN_IDS:
+        await msg.reply_text("❌ Access Denied: Support Leaders cannot send direct attachments to members.")
+        return
+
+    if uid in LEADER_IDS:
         if "reply_uid" in context.user_data:
             target_uid = context.user_data.pop("reply_uid")
             if get_assigned_leader(target_uid) != uid:
@@ -253,7 +281,6 @@ async def member_logic(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     text = update.message.text
 
-    # 1. Menu buttons are handled locally by the bot (not sent to leader)
     if text == "📖 Resources":
         await update.message.reply_text("Select a resource category:", reply_markup=RESOURCE_MENU)
         return
@@ -315,7 +342,6 @@ async def member_logic(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Go ahead, type your message and I'll pass it along.")
         return
 
-    # 2. Regular user chat messages are forwarded to the leader
     await route_to_leader(update, context, text, kind="message")
 
 async def route_to_leader(update, context, text, kind, file_id=None, file_type=None, origin="bot"):
@@ -329,7 +355,6 @@ async def route_to_leader(update, context, text, kind, file_id=None, file_type=N
 
     active_ticket = get_active_ticket(uid)
 
-    # Forward message as follow-up if conversation is open
     if active_ticket:
         _, display_id, _, _ = active_ticket
         try:
@@ -343,7 +368,6 @@ async def route_to_leader(update, context, text, kind, file_id=None, file_type=N
             await update.message.reply_text("Delivery failed. Please try again.")
         return
 
-    # Create new ticket if no active session exists
     display_id = next_ticket_display(origin)
     with sqlite3.connect("bot_data.db") as conn:
         conn.execute(
@@ -406,6 +430,9 @@ async def send_resource_content(update: Update, context: ContextTypes.DEFAULT_TY
 # ----------------------------
 async def reply_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE):
     leader_id = update.effective_user.id
+    if is_support_leader_blocked(leader_id):
+        await block_support_chat_attempts(update)
+        return
     if leader_id not in LEADER_IDS:
         return
 
@@ -426,7 +453,6 @@ async def reply_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Notice: This ticket has already been resolved and closed.")
         return
 
-    # Enforce Leader Isolation
     if get_assigned_leader(target_uid) != leader_id:
         await update.message.reply_text("Access Denied: You are not authorized to communicate with this member.")
         return
@@ -436,6 +462,9 @@ async def reply_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def close_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE):
     leader_id = update.effective_user.id
+    if is_support_leader_blocked(leader_id):
+        await block_support_chat_attempts(update)
+        return
     if leader_id not in LEADER_IDS:
         return
 
@@ -474,6 +503,9 @@ async def close_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def msg_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     leader_id = update.effective_user.id
+    if is_support_leader_blocked(leader_id):
+        await block_support_chat_attempts(update)
+        return
     if leader_id not in LEADER_IDS:
         return
 
@@ -487,7 +519,6 @@ async def msg_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Error: Invalid User ID format.")
         return
 
-    # Enforce Leader Isolation
     if get_assigned_leader(target_uid) != leader_id:
         await update.message.reply_text("Access Denied: You are not the assigned leader for this member.")
         return
@@ -594,6 +625,9 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def track_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     leader_id = update.effective_user.id
+    if is_support_leader_blocked(leader_id):
+        await block_support_chat_attempts(update)
+        return
     if leader_id not in LEADER_IDS:
         return
 
@@ -634,13 +668,10 @@ async def addhymn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Upload media for Hymns category (Photo, Voice, or File).")
 
 # ----------------------------
-# SUPPORT ADMIN ADDITIONS
+# SUPPORT LEADER ADDITIONS
 # ----------------------------
-raw_support_admins = os.environ.get("SUPPORT_ADMIN_IDS", "999888777")
-SUPPORT_ADMIN_IDS = [int(x.strip()) for x in raw_support_admins.split(",") if x.strip().isdigit()]
-
 async def status_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Support Admin command: /status — view leader workloads and active tickets."""
+    """Support Leader command: /status — view leader workloads and active tickets."""
     uid = update.effective_user.id
     if uid not in SUPPORT_ADMIN_IDS:
         return
@@ -677,7 +708,7 @@ async def status_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(status_text)
 
 async def transfer_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Support Admin command: /transfer_ticket <ticket_id> <new_leader_id>"""
+    """Support Leader command: /transfer_ticket <ticket_id> <new_leader_id>"""
     uid = update.effective_user.id
     if uid not in SUPPORT_ADMIN_IDS:
         return
@@ -718,7 +749,7 @@ async def transfer_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Ticket #{ref} successfully reassigned to Leader {new_leader}.")
 
 async def admin_transfer_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Support Admin command: /admintransfer <user_id> <new_leader_id> (separate from the Leader's own /transfer)"""
+    """Support Leader command: /admintransfer <user_id> <new_leader_id>"""
     uid = update.effective_user.id
     if uid not in SUPPORT_ADMIN_IDS:
         return
@@ -741,7 +772,7 @@ async def admin_transfer_member(update: Update, context: ContextTypes.DEFAULT_TY
     await update.message.reply_text(f"✅ Member {target_uid} successfully transferred to Leader {new_leader}.")
 
 async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Support Admin command: /adminbroadcast <message> (separate from the Leader's own /broadcast)"""
+    """Support Leader command: /adminbroadcast <message>"""
     uid = update.effective_user.id
     if uid not in SUPPORT_ADMIN_IDS:
         return
@@ -765,7 +796,7 @@ async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Broadcast completed. Success: {sent}, Failed: {failed}.")
 
 async def admin_add_resource(update: Update, context: ContextTypes.DEFAULT_TYPE, category: str):
-    """Support Admin upload trigger for PDFs/Sermons/Devotionals/Hymns (separate from the Leader's addsermon/adddevotional/addhymn)"""
+    """Support Leader upload trigger for media resources & PDFs"""
     uid = update.effective_user.id
     if uid not in SUPPORT_ADMIN_IDS:
         return
@@ -774,11 +805,11 @@ async def admin_add_resource(update: Update, context: ContextTypes.DEFAULT_TYPE,
     await update.message.reply_text(f"Upload media or PDF for the {category.capitalize()} category now.")
 
 def is_support_leader_blocked(uid: int) -> bool:
-    """Returns True if user is a Support Leader trying to perform chat/history actions."""
+    """Returns True if user is a Support Leader trying to perform direct chat/history actions."""
     return uid in SUPPORT_ADMIN_IDS
 
 async def block_support_chat_attempts(update: Update):
-    """Call inside /ticket, /msg, /track, /close or text message routers."""
+    """Blocks Support Leaders from attempting direct chat or viewing history."""
     if is_support_leader_blocked(update.effective_user.id):
         await update.message.reply_text("❌ Access Denied: Support Leaders cannot view history or chat directly with members.")
         return True
@@ -806,6 +837,8 @@ app.add_handler(CommandHandler("broadcast", broadcast))
 app.add_handler(CommandHandler("addsermon", addsermon))
 app.add_handler(CommandHandler("adddevotional", adddevotional))
 app.add_handler(CommandHandler("addhymn", addhymn))
+
+# Support Leader Command Handlers
 app.add_handler(CommandHandler("status", status_dashboard))
 app.add_handler(CommandHandler("transfer_ticket", transfer_ticket))
 app.add_handler(CommandHandler("admintransfer", admin_transfer_member))
