@@ -564,8 +564,14 @@ async def transfer_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     old_leader = get_assigned_leader(target_uid)
 
     with sqlite3.connect("bot_data.db") as conn:
-        conn.execute("UPDATE members SET assigned_leader=? WHERE user_id=?", (new_leader, target_uid))
-        conn.execute("UPDATE tickets SET leader_id=? WHERE uid=? AND status='open'", (new_leader, target_uid))
+        cursor = conn.cursor()
+        cursor.execute("UPDATE members SET assigned_leader=? WHERE user_id=?", (new_leader, target_uid))
+        if cursor.rowcount == 0:
+            await update.message.reply_text(
+                f"❌ Error: User ID `{target_uid}` not found in registered members."
+            )
+            return
+        cursor.execute("UPDATE tickets SET leader_id=? WHERE uid=? AND status='open'", (new_leader, target_uid))
 
     try:
         await context.bot.send_message(
@@ -776,8 +782,15 @@ async def admin_transfer_member(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     with sqlite3.connect("bot_data.db") as conn:
-        conn.execute("UPDATE members SET assigned_leader=? WHERE user_id=?", (new_leader, target_uid))
-        conn.execute("UPDATE tickets SET leader_id=? WHERE uid=? AND status='open'", (new_leader, target_uid))
+        cursor = conn.cursor()
+        cursor.execute("UPDATE members SET assigned_leader=? WHERE user_id=?", (new_leader, target_uid))
+        if cursor.rowcount == 0:
+            await update.message.reply_text(
+                f"❌ Error: User ID `{target_uid}` not found in registered members.\n"
+                f"💡 Tip: If `{target_uid}` is a Ticket ID, use: `/transfer_ticket {target_uid} {new_leader}`"
+            )
+            return
+        cursor.execute("UPDATE tickets SET leader_id=? WHERE uid=? AND status='open'", (new_leader, target_uid))
 
     # Notify Target Member
     try:
@@ -795,14 +808,14 @@ async def admin_transfer_member(update: Update, context: ContextTypes.DEFAULT_TY
             _, t_display_id, t_kind, t_msg = active_t
             await context.bot.send_message(
                 new_leader,
-                f"📌 Transfer Received: Member ID {target_uid} assigned to you.\n"
+                f"📌 Transfer Received: Member ID `{target_uid}` assigned to you.\n"
                 f"Active Ticket #{t_display_id} [{t_kind}]:\n\"{t_msg}\"\n\n"
                 f"Reply via: /ticket {t_display_id}"
             )
         else:
             await context.bot.send_message(
                 new_leader,
-                f"📌 Transfer Received: Member ID {target_uid} assigned to you.\nNo active open tickets."
+                f"📌 Transfer Received: Member ID `{target_uid}` assigned to you.\nNo active open tickets."
             )
     except Exception:
         pass
