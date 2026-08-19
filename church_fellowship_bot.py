@@ -738,10 +738,20 @@ async def transfer_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.execute("UPDATE tickets SET leader_id=? WHERE id=?", (new_leader, internal_id))
         conn.execute("UPDATE members SET assigned_leader=? WHERE user_id=?", (new_leader, member_uid))
 
+    # Notify New Leader
     try:
         await context.bot.send_message(
             new_leader,
             f"📌 Transferred Ticket #{ref}: Member `{member_uid}` assigned to you.\nReply via: /ticket {ref}"
+        )
+    except Exception:
+        pass
+
+    # Notify Target Member
+    try:
+        await context.bot.send_message(
+            member_uid,
+            f"Notice: Your open ticket (#{ref}) has been transferred to a new fellowship leader."
         )
     except Exception:
         pass
@@ -768,6 +778,34 @@ async def admin_transfer_member(update: Update, context: ContextTypes.DEFAULT_TY
     with sqlite3.connect("bot_data.db") as conn:
         conn.execute("UPDATE members SET assigned_leader=? WHERE user_id=?", (new_leader, target_uid))
         conn.execute("UPDATE tickets SET leader_id=? WHERE uid=? AND status='open'", (new_leader, target_uid))
+
+    # Notify Target Member
+    try:
+        await context.bot.send_message(
+            target_uid,
+            "Notice: You have been assigned to a new fellowship leader."
+        )
+    except Exception:
+        pass
+
+    # Notify New Leader
+    active_t = get_active_ticket(target_uid)
+    try:
+        if active_t:
+            _, t_display_id, t_kind, t_msg = active_t
+            await context.bot.send_message(
+                new_leader,
+                f"📌 Transfer Received: Member ID {target_uid} assigned to you.\n"
+                f"Active Ticket #{t_display_id} [{t_kind}]:\n\"{t_msg}\"\n\n"
+                f"Reply via: /ticket {t_display_id}"
+            )
+        else:
+            await context.bot.send_message(
+                new_leader,
+                f"📌 Transfer Received: Member ID {target_uid} assigned to you.\nNo active open tickets."
+            )
+    except Exception:
+        pass
 
     await update.message.reply_text(f"✅ Member {target_uid} successfully transferred to Leader {new_leader}.")
 
