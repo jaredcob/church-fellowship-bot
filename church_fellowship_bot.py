@@ -2,6 +2,7 @@ import json
 import sqlite3
 import random
 import os
+from datetime import datetime
 from telegram import (
     Update,
     ReplyKeyboardMarkup,
@@ -23,7 +24,7 @@ from telegram.ext import (
 TOKEN = os.environ["BOT_TOKEN"]
 LEADER_IDS = [6555910081, 8399604250]  # Pastor/Elder Telegram User IDs
 
-# Support Leaders (Admins who manage workloads, transfer tickets, broadcast, and upload resources, but cannot chat or view history)
+# Support Leaders (Admins who manage workloads, transfer tickets, broadcast, and upload resources)
 raw_support_admins = os.environ.get("SUPPORT_ADMIN_IDS", "999888777")
 SUPPORT_ADMIN_IDS = [int(x.strip()) for x in raw_support_admins.split(",") if x.strip().isdigit()]
 
@@ -54,8 +55,28 @@ def init_db():
             leader_id INTEGER,
             kind TEXT,
             msg TEXT,
-            status TEXT DEFAULT 'open'
+            status TEXT DEFAULT 'open',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )""")
+        
+        # Upgrade existing tickets table if created_at column is missing
+        try:
+            c.execute("ALTER TABLE tickets ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+        except sqlite3.OperationalError:
+            pass
+
+        # Chat logs table to track interaction history with dates & leader IDs
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS chat_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            display_id TEXT,
+            uid INTEGER,
+            sender_id INTEGER,
+            sender_role TEXT,
+            msg TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )""")
+
         c.execute("""
         CREATE TABLE IF NOT EXISTS counters (
             name TEXT PRIMARY KEY,
@@ -77,6 +98,14 @@ def init_db():
                 "INSERT OR IGNORE INTO leader_status (leader_id, is_online) VALUES (?, 1)",
                 (lid,)
             )
+
+def log_chat_interaction(display_id, uid, sender_id, sender_role, msg_text):
+    """Helper to record every communication for audit history."""
+    with sqlite3.connect("bot_data.db") as conn:
+        conn.execute(
+            "INSERT INTO chat_logs (display_id, uid, sender_id, sender_role, msg, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (display_id, uid, sender_id, sender_role, msg_text, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        )
 
 def get_assigned_leader(uid):
     with sqlite3.connect("bot_data.db") as conn:
@@ -147,13 +176,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "──────────────────────────────\n\n"
             "📋 **Operations & Management Commands:**\n"
             "• `/status` — View real-time leader workloads & active ticket routing\n"
+            "• `/track <user_id>` or `/history <user_id>` — View member ticket & chat history\n"
             "• `/transfer_ticket <ticket_id> <leader_id>` — Transfer an open ticket to another leader\n"
             "• `/admintransfer <user_id> <leader_id>` — Reassign a member to a new leader\n"
             "• `/adminbroadcast <message>` — Send an announcement to all members\n\n"
             "📚 **Resource Management Commands:**\n"
             "• `/adminaddpdf` | `/adminaddsermon` | `/adminadddevotional` | `/adminaddhymn` — Upload church resources\n\n"
             "───────────── Notice ─────────────\n"
-            "⚠️ **Privacy Restrictions:** Support Leaders manage operations only and do not have access to view conversation histories or directly chat with members.",
+            "⚠️ Support Leaders can view operation metrics and interaction history, but cannot send direct chat messages to members.",
             parse_mode="Markdown"
         )
         return
@@ -243,6 +273,9 @@ async def media_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             try:
                 await send_media(context, target_uid, file_type, file_id, caption="✝️ Fellowship Leader Response")
+                active_t = get_active_ticket(target_uid)
+                t_id = active_t[1] if active_t else "DIRECT"
+                log_chat_interaction(t_id, target_uid, uid, "LEADER", f"[{file_type.upper()}] {caption}")
                 await msg.reply_text("Message successfully delivered.")
             except Exception:
                 await msg.reply_text("Delivery Failed: The member may have blocked communications.")
@@ -365,17 +398,21 @@ async def route_to_leader(update, context, text, kind, file_id=None, file_type=N
                 await send_media(context, leader_id, file_type, file_id, caption=msg_body)
             else:
                 await context.bot.send_message(leader_id, msg_body)
+            log_chat_interaction(display_id, uid, uid, "MEMBER", text)
             await update.message.reply_text("✅ Message sent to your leader.")
         except Exception:
             await update.message.reply_text("Delivery failed. Please try again.")
         return
 
     display_id = next_ticket_display(origin)
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with sqlite3.connect("bot_data.db") as conn:
         conn.execute(
-            "INSERT INTO tickets (display_id, uid, leader_id, kind, msg, status) VALUES (?,?,?,?,?,'open')",
-            (display_id, uid, leader_id, kind, text)
+            "INSERT INTO tickets (display_id, uid, leader_id, kind, msg, status, created_at) VALUES (?,?,?,?,?,'open',?)",
+            (display_id, uid, leader_id, kind, text, now_str)
         )
+
+    log_chat_interaction(display_id, uid, uid, "MEMBER", text)
 
     labels = {
         "prayer_request": "🙏 Prayer Request",
@@ -432,8 +469,8 @@ async def send_resource_content(update: Update, context: ContextTypes.DEFAULT_TY
 # ----------------------------
 async def reply_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE):
     leader_id = update.effective_user.id
-    if is_support_leader_blocked(leader_id):
-        await block_support_chat_attempts(update)
+    if leader_id in SUPPORT_ADMIN_IDS:
+        await update.message.reply_text("❌ Access Denied: Support Leaders cannot send direct messages to members.")
         return
     if leader_id not in LEADER_IDS:
         return
@@ -460,12 +497,13 @@ async def reply_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     context.user_data["reply_uid"] = target_uid
+    context.user_data["active_display_id"] = ref
     await update.message.reply_text(f"Active Session: Replying to Ticket #{ref} (Member ID: {target_uid}). Enter message:")
 
 async def close_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE):
     leader_id = update.effective_user.id
-    if is_support_leader_blocked(leader_id):
-        await block_support_chat_attempts(update)
+    if leader_id in SUPPORT_ADMIN_IDS:
+        await update.message.reply_text("❌ Access Denied: Support Leaders cannot modify ticket status directly.")
         return
     if leader_id not in LEADER_IDS:
         return
@@ -494,6 +532,8 @@ async def close_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with sqlite3.connect("bot_data.db") as conn:
         conn.execute("UPDATE tickets SET status='closed' WHERE id=?", (internal_id,))
 
+    log_chat_interaction(ref, target_uid, leader_id, "LEADER", f"[TICKET CLOSED BY LEADER {leader_id}]")
+
     await update.message.reply_text(f"✅ Ticket #{ref} has been marked as resolved.")
     try:
         await context.bot.send_message(
@@ -505,8 +545,8 @@ async def close_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def msg_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     leader_id = update.effective_user.id
-    if is_support_leader_blocked(leader_id):
-        await block_support_chat_attempts(update)
+    if leader_id in SUPPORT_ADMIN_IDS:
+        await update.message.reply_text("❌ Access Denied: Support Leaders cannot send direct messages.")
         return
     if leader_id not in LEADER_IDS:
         return
@@ -528,6 +568,9 @@ async def msg_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = " ".join(context.args[1:])
     try:
         await context.bot.send_message(target_uid, f"✝️ Fellowship Leader:\n{text}")
+        active_t = get_active_ticket(target_uid)
+        t_id = active_t[1] if active_t else "DIRECT"
+        log_chat_interaction(t_id, target_uid, leader_id, "LEADER", text)
         await update.message.reply_text("Message successfully delivered.")
     except Exception:
         await update.message.reply_text("Delivery Failed: Unable to reach member.")
@@ -535,6 +578,7 @@ async def msg_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def leader_text_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     acting_leader = update.effective_user.id
     uid = context.user_data.pop("reply_uid")
+    display_id = context.user_data.pop("active_display_id", "DIRECT")
 
     if get_assigned_leader(uid) != acting_leader:
         await update.message.reply_text("Access Denied: Reassignment occurred prior to reply.")
@@ -543,6 +587,7 @@ async def leader_text_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     try:
         await context.bot.send_message(uid, f"✝️ Fellowship Leader:\n{text}")
+        log_chat_interaction(display_id, uid, acting_leader, "LEADER", text)
         await update.message.reply_text("Reply successfully delivered.")
     except Exception:
         await update.message.reply_text("Delivery Failed: Member unreachable.")
@@ -631,31 +676,87 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(f"Broadcast complete. Delivered: {sent}, Failed: {failed}.")
 
+# ----------------------------
+# ENHANCED AUDIT & HISTORY TRACKING (/track & /history)
+# ----------------------------
 async def track_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    leader_id = update.effective_user.id
-    if is_support_leader_blocked(leader_id):
-        await block_support_chat_attempts(update)
-        return
-    if leader_id not in LEADER_IDS:
+    """
+    Commands: /track <user_id> or /history <user_id>
+    Accessible to:
+    - Support Leaders (SUPPORT_ADMIN_IDS): View any member's history.
+    - Full Leaders (LEADER_IDS): View history ONLY if currently assigned to that member.
+    """
+    caller_id = update.effective_user.id
+
+    if caller_id not in LEADER_IDS and caller_id not in SUPPORT_ADMIN_IDS:
         return
 
     try:
         uid = int(context.args[0])
     except (IndexError, ValueError):
-        await update.message.reply_text("Usage: /track <user_id>")
+        await update.message.reply_text("Usage: `/track <user_id>` or `/history <user_id>`", parse_mode="Markdown")
         return
 
-    if get_assigned_leader(uid) != leader_id:
-        await update.message.reply_text("Access Denied: You can only view history for members currently assigned to you.")
+    assigned_leader = get_assigned_leader(uid)
+    if not assigned_leader:
+        await update.message.reply_text(f"❌ Error: Member `{uid}` is not registered in the system.", parse_mode="Markdown")
         return
+
+    # Permissions check: Full Leaders can only track their assigned members
+    if caller_id in LEADER_IDS and caller_id not in SUPPORT_ADMIN_IDS:
+        if assigned_leader != caller_id:
+            await update.message.reply_text("❌ Access Denied: You can only view history for members assigned to you.")
+            return
 
     with sqlite3.connect("bot_data.db") as conn:
-        rows = conn.execute(
-            "SELECT display_id, kind, msg, status FROM tickets WHERE uid=? ORDER BY id", (uid,)
+        # Fetch all tickets (OPEN and CLOSED)
+        tickets = conn.execute(
+            "SELECT display_id, kind, msg, status, leader_id, created_at FROM tickets WHERE uid=? ORDER BY id DESC",
+            (uid,)
         ).fetchall()
 
-    txt = "\n".join(f"#{i} [{s.upper()}] [{k}] {m}" for i, k, m, s in rows)
-    await update.message.reply_text(f"📜 Interaction History for Member {uid}:\n{txt}" if txt else "No records found.")
+        # Fetch chat log history
+        logs = conn.execute(
+            "SELECT display_id, sender_id, sender_role, msg, created_at FROM chat_logs WHERE uid=? ORDER BY id ASC",
+            (uid,)
+        ).fetchall()
+
+    if not tickets and not logs:
+        await update.message.reply_text(f"📜 **Interaction History for Member `{uid}`**\n\nNo ticket or chat records found.", parse_mode="Markdown")
+        return
+
+    out = f"📜 **MEMBER INTERACTION & HISTORY REPORT**\n"
+    out += "──────────────────────────────\n"
+    out += f"👤 **Member ID:** `{uid}`\n"
+    out += f"👑 **Assigned Leader:** `{assigned_leader}`\n\n"
+
+    out += "🎟️ **Ticket History (Open & Closed):**\n"
+    if tickets:
+        for display_id, kind, msg, status, l_id, created_at in tickets:
+            status_icon = "🟢 OPEN" if status == "open" else "🔴 CLOSED"
+            created_str = created_at if created_at else "N/A"
+            out += f"• **Ticket #{display_id}** [{status_icon}]\n"
+            out += f"  ├ Type: `{kind}`\n"
+            out += f"  ├ Assigned Leader: `{l_id}`\n"
+            out += f"  ├ Created Date/Time: `{created_str}`\n"
+            out += f"  └ Initial Msg: \"{msg}\"\n"
+    else:
+        out += "• No ticket records.\n"
+
+    out += "\n💬 **Communication Audit Logs (Who Spoke & When):**\n"
+    if logs:
+        for t_display, sender_id, role, message_text, log_time in logs:
+            speaker_label = f"Leader `{sender_id}`" if role == "LEADER" else f"Member `{sender_id}`"
+            out += f"• [`{log_time}`] (Ticket #{t_display}) **{speaker_label}** ➔ {message_text}\n"
+    else:
+        out += "• No communication logs found.\n"
+
+    # Split message if it exceeds Telegram's 4096 character limit
+    if len(out) > 4000:
+        for chunk in [out[i:i + 4000] for i in range(0, len(out), 4000)]:
+            await update.message.reply_text(chunk, parse_mode="Markdown")
+    else:
+        await update.message.reply_text(out, parse_mode="Markdown")
 
 async def addsermon(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in LEADER_IDS:
@@ -748,6 +849,8 @@ async def transfer_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.execute("UPDATE tickets SET leader_id=? WHERE id=?", (new_leader, internal_id))
         conn.execute("UPDATE members SET assigned_leader=? WHERE user_id=?", (new_leader, member_uid))
 
+    log_chat_interaction(ref, member_uid, uid, "SUPPORT_ADMIN", f"[TICKET TRANSFERRED TO LEADER {new_leader}]")
+
     # Notify New Leader
     try:
         await context.bot.send_message(
@@ -795,6 +898,8 @@ async def admin_transfer_member(update: Update, context: ContextTypes.DEFAULT_TY
             )
             return
         cursor.execute("UPDATE tickets SET leader_id=? WHERE uid=? AND status='open'", (new_leader, target_uid))
+
+    log_chat_interaction("SYSTEM", target_uid, uid, "SUPPORT_ADMIN", f"[MEMBER REASSIGNED TO LEADER {new_leader}]")
 
     # Notify Target Member
     try:
@@ -859,17 +964,6 @@ async def admin_add_resource(update: Update, context: ContextTypes.DEFAULT_TYPE,
     context.user_data["awaiting_resource_cat"] = category
     await update.message.reply_text(f"Upload media or PDF for the {category.capitalize()} category now.")
 
-def is_support_leader_blocked(uid: int) -> bool:
-    """Returns True if user is a Support Leader trying to perform direct chat/history actions."""
-    return uid in SUPPORT_ADMIN_IDS
-
-async def block_support_chat_attempts(update: Update):
-    """Blocks Support Leaders from attempting direct chat or viewing history."""
-    if is_support_leader_blocked(update.effective_user.id):
-        await update.message.reply_text("❌ Access Denied: Support Leaders cannot view history or chat directly with members.")
-        return True
-    return False
-
 # ----------------------------
 # INITIALIZATION & EXECUTION
 # ----------------------------
@@ -887,6 +981,7 @@ app.add_handler(CommandHandler("ticket", reply_ticket))
 app.add_handler(CommandHandler("close", close_ticket))
 app.add_handler(CommandHandler("msg", msg_member))
 app.add_handler(CommandHandler("track", track_member))
+app.add_handler(CommandHandler("history", track_member))
 app.add_handler(CommandHandler("transfer", transfer_member))
 app.add_handler(CommandHandler("broadcast", broadcast))
 app.add_handler(CommandHandler("addsermon", addsermon))
