@@ -143,16 +143,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if uid in SUPPORT_ADMIN_IDS:
         await update.message.reply_text(
-            "====================================\n"
-            "    SUPPORT LEADER CONTROL PORTAL   \n"
-            "====================================\n\n"
-            "Available Operations Commands:\n"
-            "• /status - View leader workloads & active ticket routing\n"
-            "• /transfer_ticket <ticket_id> <leader_id> - Transfer ticket to leader\n"
-            "• /admintransfer <user_id> <leader_id> - Reassign member to leader\n"
-            "• /adminbroadcast <message> - Send announcement to all members\n"
-            "• /adminaddpdf | /adminaddsermon | /adminadddevotional | /adminaddhymn - Upload resources\n\n"
-            "⚠️ Notice: Support Leaders cannot view history or chat directly with members."
+            "🛡️ **SUPPORT LEADER CONTROL PORTAL**\n"
+            "──────────────────────────────\n\n"
+            "📋 **Operations & Management Commands:**\n"
+            "• `/status` — View real-time leader workloads & active ticket routing\n"
+            "• `/transfer_ticket <ticket_id> <leader_id>` — Transfer an open ticket to another leader\n"
+            "• `/admintransfer <user_id> <leader_id>` — Reassign a member to a new leader\n"
+            "• `/adminbroadcast <message>` — Send an announcement to all members\n\n"
+            "📚 **Resource Management Commands:**\n"
+            "• `/adminaddpdf` | `/adminaddsermon` | `/adminadddevotional` | `/adminaddhymn` — Upload church resources\n\n"
+            "───────────── Notice ─────────────\n"
+            "⚠️ **Privacy Restrictions:** Support Leaders manage operations only and do not have access to view conversation histories or directly chat with members.",
+            parse_mode="Markdown"
         )
         return
 
@@ -696,22 +698,24 @@ async def status_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if lid in workload_map:
             workload_map[lid] = count
 
-    status_text = "📊 **SYSTEM WORKLOAD & LEADER STATUS**\n\n"
-    status_text += f"👥 **Total Registered Members:** {total_members}\n"
-    status_text += f"💬 **Users Currently Talking:** {len(active_chats)}\n\n"
+    status_text = "🌐 **SYSTEM DASHBOARD & WORKLOAD OVERVIEW**\n"
+    status_text += "──────────────────────────────\n\n"
+    status_text += "📊 **System Metrics:**\n"
+    status_text += f"• Total Registered Members: **{total_members}**\n"
+    status_text += f"• Active Conversations: **{len(active_chats)}**\n\n"
 
-    status_text += "⚖️ **Leader Ticket Load:**\n"
+    status_text += "⚖️ **Leader Workload Distribution:**\n"
     for lid, count in workload_map.items():
-        status_text += f"• Leader `{lid}`: **{count} active ticket(s)**\n"
+        status_text += f"• Leader `{lid}`: **{count}** open ticket(s)\n"
 
-    status_text += "\n📌 **Active Ticket Routing:**\n"
+    status_text += "\n🔀 **Active Ticket Routing:**\n"
     if active_chats:
         for display_id, m_id, l_id in active_chats:
-            status_text += f"• Ticket #{display_id} | Member `{m_id}` ➡️ Leader `{l_id}`\n"
+            status_text += f"• Ticket **#{display_id}** | Member `{m_id}` ➔ Leader `{l_id}`\n"
     else:
         status_text += "• No open tickets at this time.\n"
 
-    await update.message.reply_text(status_text)
+    await update.message.reply_text(status_text, parse_mode="Markdown")
 
 async def transfer_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Support Leader command: /transfer_ticket <ticket_id> <new_leader_id>"""
